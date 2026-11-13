@@ -4873,6 +4873,20 @@ def _realm_fold_reproducible(disk):
 
 
 def _scan_usage_from(offset, fold, stop_at=None, skip=None, skip_raw=None, path=None):
+    """一次扫描的公共入口：读行 + 折叠，结束时清掉取价上下文。
+
+    读循环本身在 _scan_usage_rows()（说明见那里）。这层只负责「扫描开始/结束」
+    这对边界：wb_pricing 的扫描上下文挂在线程局部上，扫完必须清掉，否则同一
+    线程上后续的单行取价（最近请求的悬停气泡）会读到上一轮扫描的旧价表。
+    """
+    try:
+        return _scan_usage_rows(offset, fold, stop_at=stop_at, skip=skip,
+                                skip_raw=skip_raw, path=path)
+    finally:
+        wb_pricing.end_scan_pricing()
+
+
+def _scan_usage_rows(offset, fold, stop_at=None, skip=None, skip_raw=None, path=None):
     """Fold every row past `offset` into `fold(row)`; returns (offset, error).
 
     The offset handed back is the end of the last row the pass got through.
@@ -5131,6 +5145,11 @@ def _row_cost(row, pricing, pricing_on):
 
     返回的形状与 wb_pricing.cost_for_row(..., details=False) 逐键相同；命中
     时按条目重建一份，调用方拿到的是自己的副本，与现算路径一致。
+
+    价表快照与校准系数在这里**按扫描代次**向下传（cost_for_row 的 pricing /
+    markup 入参）：不传的话每行都要重新问一次「价表文件在哪、mtime 是多少、
+    pricing-markup.json 变了没」，一次六万行的扫描光这些 stat 就是秒级。传
+    下去的仍是同一个文件读出的同一份对象，逐行结果不变。
     """
     if pricing is None or not row:
         return wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
@@ -5146,6 +5165,11 @@ def _row_cost(row, pricing, pricing_on):
         return wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
     if entry is not None and _pricing_unchanged(entry[0], pricing):
         return _cost_from_memo(entry)
+    if pricing is not None:
+        # 把「本次扫描的价表快照」挂到线程局部上下文：取价时同一份文件不必
+        # 每行重新 stat（见 wb_pricing.begin_scan_pricing）。代次不变时它连
+        # 校准系数表一起沿用，第二次进入几乎没有成本。
+        wb_pricing.begin_scan_pricing(pricing[3] if pricing[0] else None, pricing)
     cost = wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
     _row_cost_remember(key, pricing, cost)
     return cost
@@ -10230,24 +10254,40 @@ def _build_key_rows(key_map, realm=None):
     return out
 
 
+# 指标页账号表只读这几个标量（dashboard.html 的积分列取 remain / size）；
+# packages / checkin / 最早到期 这类明细是「账号页」的活，由 account_views()/
+# /accounts/credits 单独提供。把它们塞进 5 秒一轮的指标载荷，等于每个账号每轮
+# 都带一份用不到的套餐历史——481 个账号约 11.5 MB，占整份响应体积的 96%。
+_ANALYTICS_CREDIT_KEYS = ("remain", "used", "size", "used_percent",
+                          "remain_percent", "is_paid_user", "updated_iso")
+
+
+def _analytics_credits(credits):
+    """积分快照的标量子集（指标页用），未知形状原样返回。"""
+    if not isinstance(credits, dict) or not credits:
+        return credits if isinstance(credits, dict) else {}
+    return {k: credits[k] for k in _ANALYTICS_CREDIT_KEYS if k in credits}
+
+
 def _enrich_accounts_from_pool(acct_map, realm=None):
     """Attach nickname/realm/credits for accounts that saw no traffic."""
     if POOL:
         for a in POOL.accounts:
             if realm and a.realm != realm:
                 continue
+            credits = _analytics_credits(getattr(a, "credits", None) or {})
             if a.uid in acct_map:
                 acct_map[a.uid]["nickname"] = a.nickname
                 acct_map[a.uid]["realm"] = a.realm
                 acct_map[a.uid]["domain"] = a.domain
-                acct_map[a.uid]["credits"] = getattr(a, "credits", None) or {}
+                acct_map[a.uid]["credits"] = credits
             else:
                     acct_map[a.uid] = {
                         "uid": a.uid,
                         "nickname": a.nickname,
                         "realm": a.realm,
                         "domain": a.domain,
-                        "credits": getattr(a, "credits", None) or {},
+                        "credits": credits,
                         "window": _new_analytics_stat(),
                         "all_time": _new_analytics_stat(),
                         "window_models": {},
@@ -21714,6 +21754,18 @@ def _if_none_match_hit(header_value, etag):
     return False
 
 
+# 压好的响应字节，按缓存条目的校验符存放（见 Handler._encode_body）。
+# 面板 5 秒一轮、同一份载荷在 TTL 内会重复要好几次，压缩只该付一次。
+# 无锁：键是「条目标识」，写入是单次赋值；并发下最多多压一份，结果仍正确。
+_GZ_BODY_CACHE = {}
+
+# 响应压缩的逃生开关：`WB_PANEL_GZIP=0` 关掉之后所有出口原样回明文，
+# 与加压缩之前逐字节一致（排查「某个客户端/反代不吃 gzip」时先关这里）。
+# 只影响本网关自己的响应，不影响它对上游请求的 Accept-Encoding。
+_GZIP_ENABLED = (os.environ.get("WB_PANEL_GZIP", "1").strip().lower()
+                 not in ("0", "false", "no", "off"))
+
+
 def _cache_etag(kind, key, built_at):
     """给带 TTL 缓存的只读接口派生一个强校验符（ETag）。
 
@@ -21940,11 +21992,60 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         log(fmt % args)
+    # 面板的只读 JSON 动辄几百 KB 到十几 MB，而全仓此前只有对**上游**的 gzip
+    # 解压、没有任何响应压缩。阈值取 1400 B：小于这个尺寸压缩反而更慢。
+    _GZIP_MIN_BYTES = 1400
+    _GZIP_FAST_ABOVE = 1500000
+
+    def _encode_body(self, body, cache_key=None):
+        """按客户端能力压缩响应体，返回 (要写出的字节, Content-Encoding)。
+
+        `cache_key`（_json_cached 传入的校验符）用来把压好的字节留在进程里：
+        同一份缓存条目在 TTL 内会被面板轮询多次，压一次就够——否则每轮都要
+        在 GIL 上重付一遍大载荷的压缩成本。校验符变了即新条目，旧字节自然
+        不再被取到。
+        """
+        if len(body) < self._GZIP_MIN_BYTES or not _GZIP_ENABLED:
+            return body, None
+        try:
+            accept = (self.headers.get("Accept-Encoding") or "").lower()
+        except Exception:
+            accept = ""
+        if "gzip" not in accept:
+            return body, None
+        if cache_key is not None:
+            hit = _GZ_BODY_CACHE.get(cache_key)
+            if hit is not None:
+                return hit, "gzip"
+        try:
+            level = 1 if len(body) > self._GZIP_FAST_ABOVE else 6
+            packed = gzip.compress(body, level)
+        except Exception:
+            # 压缩失败不能让响应路径崩掉，退回明文。
+            return body, None
+        if cache_key is not None:
+            # 只留最近几条缓存条目的压缩结果：面板同时轮询的接口只有几个，
+            # 条目一过期就不再命中，留着纯占内存（大载荷一份就是几百 KB）。
+            if len(_GZ_BODY_CACHE) >= 8:
+                _GZ_BODY_CACHE.pop(next(iter(_GZ_BODY_CACHE)), None)
+            _GZ_BODY_CACHE[cache_key] = packed
+        return packed, "gzip"
+
     def _json(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        # separators 去掉多余空格：大载荷能省 3~5% 的字节，解析端也略快；
+        # 语义与默认分隔符完全一致（JSON 不要求空白）。
+        body = json.dumps(obj, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
+        # 校验符走实例属性而不是加参数：`_json()` 是被测试桩复写的公开缝
+        # （tests/_test_usage_timeseries.py 等），签名一变它们就全炸。
+        payload, encoding = self._encode_body(
+            body, getattr(self, "_json_gz_key", None))
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(payload)))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         # 429 需要把恢复时刻带出去（见 rate_limit_headers）；其余响应一个
         # 头都不多发，保持与从前逐字节一致。
         for name, value in (self._json_extra_headers or ()):
@@ -21963,7 +22064,7 @@ class Handler(BaseHTTPRequestHandler):
         if cors_origin_allowed(getattr(self, "path", "") or ""):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(payload)
         # Flush here rather than relying on the caller: with HTTP/1.1
         # keep-alive the client blocks until the response is actually on the
         # wire, and an error reply only flushed at the end of the handler looks
@@ -22018,11 +22119,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self._json_etag = etag
+            # 同一份缓存条目在 TTL 内会被轮询多次：让 _json() 把压好的字节
+            # 按这个校验符留一份，重复轮询就不再重压大载荷。
+            self._json_gz_key = etag
         try:
             return self._json(code, data)
         finally:
             # 无论 _json() 是否抛异常，都不能把这次请求的 tag 留给下一次。
             self._json_etag = None
+            self._json_gz_key = None
 
     # ---- 面板出口的脱敏封装 ----------------------------------------------
     # 刻意**不**在 _json() 里挂钩子：/v1/chat/completions、/v1/responses、
@@ -23516,10 +23621,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("ETag", etag)
                 self.end_headers()
                 return
+        # 整页 1.3 MB 的 HTML 同样压缩后再发：面板首屏在 Tailscale / 手机上
+        # 的体感差别最大，而压缩一份静态字节只要十几毫秒。
+        payload, encoding = self._encode_body(body)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(payload)))
         self.send_header("X-Robots-Tag", "noindex, nofollow")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         # no-cache 而不是 no-store：允许存储，但每次使用前必须回源校验；配合
         # 上面的校验符，校验命中的代价是一次 304 而不是整页约 470KB。不加
         # max-age：没有它浏览器每次打开都会校验，应用更新后新版页面立即生效。
@@ -23527,7 +23638,7 @@ class Handler(BaseHTTPRequestHandler):
         if etag is not None:
             self.send_header("ETag", etag)
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(payload)
     def _read_chunked_body(self, max_bytes=MAX_PAYLOAD_BYTES):
         """Decode a Transfer-Encoding: chunked body into bytes.
 

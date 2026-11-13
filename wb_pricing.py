@@ -923,9 +923,8 @@ def _candidate_file():
     env = os.environ.get("WB_PRICING_FILE")
     if env:
         return env
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "pricing", "pricing.json")
-    return path if os.path.isfile(path) else None
+    candidate = os.path.join(_here, "pricing", "pricing.json")
+    return candidate if os.path.isfile(candidate) else None
 
 
 def load_pricing():
@@ -1060,6 +1059,60 @@ def _pick(rate, key, fallback=None):
     return _as_float(value)
 
 
+# ---- 一次聚合扫描的取价上下文 ------------------------------------------------
+# 账本逐行取价时，每一行原本都要重新问三件事：价表文件在哪（os.path.isfile）、
+# 它的 mtime 是多少（缓存键）、pricing-markup.json 变了没（getmtime+getsize）。
+# 六万行的扫描里这几项合计是秒级，而一次扫描看到的本来就该是同一份价表快照
+# （与 `pricing_enabled()` 的「扫描开头问一次」同一条口径）。
+#
+# 这里用一个线程局部的上下文把「本次扫描读到的那份价表 + 每个模型算过一次的
+# 校准系数」带上，只对 `details=False` 的聚合路径生效：
+#   * 单行展示（最近请求的气泡，details=True）永远现场读文件，看到的是最新价；
+#   * 没有上下文时（直接调用 / 测试 / 别的模块）行为与从前逐字节一致。
+# 代次按 `_pricing_inputs()` 元组的**身份**判定：一次扫描里它是同一个对象，
+# 下一次扫描是新对象，于是上下文自然换新，不需要谁去显式清理。
+_scan_ctx = threading.local()
+
+
+def begin_scan_pricing(doc, generation=None):
+    """标记「这一轮扫描用的是 doc 这份价表」；代次不变则沿用已算过的系数。"""
+    if generation is not None and getattr(_scan_ctx, "generation", None) is generation:
+        return
+    _scan_ctx.doc = doc
+    _scan_ctx.generation = generation
+    _scan_ctx.markup = {}
+
+
+def end_scan_pricing():
+    """扫描结束：清掉上下文，免得同一线程上后续的单行取价读到旧的快照。"""
+    for name in ("doc", "generation", "markup"):
+        try:
+            delattr(_scan_ctx, name)
+        except AttributeError:
+            pass
+
+
+def scan_pricing_doc():
+    """当前扫描的价表快照；不在扫描里（或没有上下文）时返回 None。"""
+    return getattr(_scan_ctx, "doc", None)
+
+
+def _scan_markup(model):
+    """扫描内按模型记忆校准系数；没有扫描上下文时照旧逐次读文件。"""
+    cache = getattr(_scan_ctx, "markup", None)
+    if cache is None:
+        return markup_for(model)
+    hit = cache.get(model, _MARKUP_MISS)
+    if hit is not _MARKUP_MISS:
+        return hit
+    value = markup_for(model)
+    cache[model] = value
+    return value
+
+
+_MARKUP_MISS = object()
+
+
 def compute_row(row, pricing=None):
     """The estimated cost of one usage row, in CNY.
 
@@ -1093,9 +1146,11 @@ def compute_row(row, pricing=None):
     hit = _pick(rate, "input_cache_hit", "input_cache_miss")
     out_rate = _pick(rate, "output")
     cny = (uncached * miss + cached * hit + output * out_rate) / unit * factor
-    markup = markup_for(row.get("model"))
-    if markup != 1.0:
-        cny *= markup
+    # markup 由调用方按「这次扫描的价表代次」传入时就不再逐行 stat 那个文件
+    # （见 wb_proxy._markup_for_scan）；None 表示自己取，逐行路径语义不变。
+    factor_markup = _scan_markup(row.get("model"))
+    if factor_markup != 1.0:
+        cny *= factor_markup
     return {"cny": cny, "known": True, "band": band, "rates": rate}
 
 
@@ -1573,15 +1628,34 @@ _timeline_cache = {"key": None, "data": None}
 _data_dir_override = None
 
 
+_here = os.path.dirname(os.path.abspath(__file__))
+_data_dir_cache = {"key": None, "value": None}
+
+
 def data_dir():
-    """Where the policy files live: the usage folder by default."""
-    if _data_dir_override:
-        return _data_dir_override
+    """Where the policy files live: the usage folder by default.
+
+    聚合一份账本时每行都要问几次这个目录（`_data_paths` → `policy_ref_at` →
+    `load_timeline`），而 `os.path.abspath(__file__)` 每次调用都要做一遍路径
+    规范化：二十万行的一次首页扫描光这一项就要吃掉上百毫秒。答案只由
+    「覆盖目录 + 两个环境变量」决定，按这三者缓存，`set_data_dir()` 改覆盖时
+    键自然变化。
+    """
+    override = _data_dir_override
     env = os.environ.get("WB_PRICING_DIR")
-    if env:
-        return env
     usage = os.environ.get("WB_PROXY_USAGE_DIR")
-    return usage or os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage")
+    key = (override, env, usage)
+    hit = _data_dir_cache
+    if hit["key"] == key and hit["value"] is not None:
+        return hit["value"]
+    if override:
+        value = override
+    elif env:
+        value = env
+    else:
+        value = usage or os.path.join(_here, "usage")
+    _data_dir_cache.update({"key": key, "value": value})
+    return value
 
 
 def set_data_dir(path):
@@ -2451,6 +2525,12 @@ def cost_for_row(row, details=True, enabled=None):
     （None 表示逐行自己查，逐行路径「每行都查、改设置当场生效」的原语义不
     变）。聚合因此看到的是扫描开始那一刻的开关值：设置改动从下一次扫描起
     生效——整表本来就是一次快照，这与其它字段的口径一致。
+
+    `pricing` / `markup` 不是参数：聚合扫描在折叠每一行之前用
+    `begin_scan_pricing()` 把「本次扫描读到的价表」放进线程局部上下文，取价
+    时直接读那一份（校准系数按模型记忆），于是同一个文件在一次六万行的扫描里
+    只被 stat 一次而不是每行几次。单行展示（details=True）永远现场读文件；
+    没有上下文时（直接调用、测试、别的模块）行为与从前逐字节一致。
     """
     if not row or not (pricing_enabled() if enabled is None else enabled):
         cost = {"cny": 0.0, "known": False, "band": None, "source": "builtin",
@@ -2487,7 +2567,11 @@ def cost_for_row(row, details=True, enabled=None):
                 cost["markup_from"] = ("pricing-markup.json"
                                        if markup != 1.0 else None)
         return cost
-    doc = load_pricing()
+    # 聚合扫描（details=False）用扫描上下文里那份价表：一次扫描读一次文件，
+    # 与「总开关在扫描开头问一次」同一口径；单行展示照旧现场读。
+    doc = None if details else scan_pricing_doc()
+    if doc is None:
+        doc = load_pricing()
     entry = (doc.get("models") or {}).get(model)
     cost = compute_row(row, pricing=doc)
     cost["source"] = "builtin"
